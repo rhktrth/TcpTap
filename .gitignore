@@ -1,0 +1,18 @@
+# Maven
+/target/
+
+# Java
+*.class
+hs_err_pid*
+
+# IDE
+.classpath
+.project
+.settings/
+.idea/
+.vscode/
+
+# Runtime captures and logs
+*.pcap
+*.pcapng
+*.log
