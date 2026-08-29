@@ -14,6 +14,8 @@ TcpTap の利用者は、TcpTap が観測したアプリケーションデータ
 
 中継処理が pcapng のセッション実装を直接操作すると、中継とキャプチャの責務境界が曖昧になり、キャプチャを無効にした場合の `null` 判定や方向別の分岐も中継側へ漏れます。キャプチャは中継の補助機能であり、中継側は「観測したデータ・EOF・I/O エラー」を通知することだけを知る構造が適切です。
 
+また、pcapng の block serialization、ファイル書込みの障害分離、擬似 TCP のシーケンス状態、IPv4 / IPv6 packet 構築を一つの `PcapNgWriter` がすべて持つと、プロセス共有の出力責務とセッション単位の状態責務が混在します。
+
 ## 決定
 
 TcpTap はネイティブのパケットキャプチャを標準機能にせず、TcpTap が観測したバイトストリームから論理的な TCP 通信を再構成した擬似パケットと、TcpTap 自身が確実に観測した診断イベントを、同一 pcapng セクション内の別インターフェースに分離して保存します。
@@ -31,6 +33,9 @@ TcpTap はネイティブのパケットキャプチャを標準機能にせず�
 - `StreamTap` は `PcapNgWriter.SessionCapture` を直接参照せず、方向を含む `TrafficObserver` へデータ・EOF・I/O エラーを通知する。pcapng セッションはこの Observer を実装する。
 - キャプチャを使用しない場合は `NoopTrafficObserver` を使用し、方向別中継処理にキャプチャ有無の条件分岐を持たせない。
 - Observer は同期キューや別スレッドを設けず、従来どおり読み取り直後に同じ中継スレッドから同期的に通知する。
+- `PcapNgWriter` はキャプチャ機能の Facade とし、セッション生成、接続失敗診断の構築、ライフサイクル調整だけを担当する。
+- pcapng の Section Header / Interface Description / Enhanced Packet Block の serialization、出力の直列化、書込み失敗の隔離は `PcapNgEncoder` が担当する。
+- セッションごとの擬似 TCP endpoint、sequence / acknowledgment、IPv4 packet ID、FIN / RST 状態、packet 構築は `SyntheticTcpSession` が担当する。
 - 文書とファイルのメタデータで、擬似パケットと診断イベントのいずれも、ネットワーク上の実パケットをキャプチャしたものではないことを明示する。
 
 ## 影響
@@ -38,6 +43,8 @@ TcpTap はネイティブのパケットキャプチャを標準機能にせず�
 Npcap / libpcap やパケットキャプチャ権限がなくても、Wireshark が読めるファイルを生成できます。接続成功したセッションでは、アプリケーションプロトコルのディセクターやストリーム内容の確認に利用でき、接続失敗したセッションでも `CONNECT_ERROR` のような TcpTap 自身の観測事実をキャプチャファイル単体から確認できます。
 
 中継処理は pcapng の内部型から分離され、キャプチャ有無にかかわらず同じ `TrafficObserver` 呼出しを行います。これによって capture format の実装詳細を `StreamTap` へ持ち込まず、キャプチャ障害を中継障害へ変換しない境界を維持します。
+
+pcapng の byte-level serialization と擬似 TCP 状態も別コンポーネントとなるため、プロセス共有の出力同期とセッション固有の状態遷移を独立して追跡できます。`PcapNgWriter.SessionCapture` は既存のセッション操作を保持する薄い Facade とし、実際の状態は `SyntheticTcpSession` が所有します。
 
 キャプチャには、TcpTap が読み取った後で反対側への書込みに失敗したペイロードも含まれ得ます。そのため、再構成ストリームは TcpTap の観測点で見えたバイトストリームを表し、反対側アプリケーションへの配送成功を証明しません。
 
