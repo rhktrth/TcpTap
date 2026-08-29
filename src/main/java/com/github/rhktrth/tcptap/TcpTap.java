@@ -12,6 +12,8 @@ import java.io.PrintStream;
 import java.net.Socket;
 import java.util.Locale;
 
+import com.github.rhktrth.tcptap.TrafficObserver.Direction;
+
 final class TcpTap implements Runnable {
     private static final int BUFFER_SIZE = 16 * 1024;
 
@@ -24,16 +26,17 @@ final class TcpTap implements Runnable {
     private final StreamTap destinationToClient;
 
     TcpTap(long sessionId, Socket clientSocket, Socket destinationSocket, long startedNanos,
-            PrintStream out, PcapNgWriter.SessionCapture sessionCapture) {
+            PrintStream out, TrafficObserver observer) {
         this.sessionId = sessionId;
         this.clientSocket = clientSocket;
         this.destinationSocket = destinationSocket;
         this.startedNanos = startedNanos;
         this.out = out;
+        TrafficObserver effectiveObserver = observer == null ? NoopTrafficObserver.INSTANCE : observer;
         clientToDestination = new StreamTap(
-                "C->D", true, clientSocket, destinationSocket, sessionCapture);
+                Direction.CLIENT_TO_DESTINATION, clientSocket, destinationSocket, effectiveObserver);
         destinationToClient = new StreamTap(
-                "D->C", false, destinationSocket, clientSocket, sessionCapture);
+                Direction.DESTINATION_TO_CLIENT, destinationSocket, clientSocket, effectiveObserver);
     }
 
     @Override
@@ -86,22 +89,19 @@ final class TcpTap implements Runnable {
     }
 
     private final class StreamTap implements Runnable {
-        private final String direction;
-        private final boolean clientToDestination;
+        private final Direction direction;
         private final Socket inputSocket;
         private final Socket outputSocket;
-        private final PcapNgWriter.SessionCapture sessionCapture;
+        private final TrafficObserver observer;
         private long bytesTransferred;
         private String endReason = "UNKNOWN";
 
-        private StreamTap(String direction, boolean clientToDestination,
-                Socket inputSocket, Socket outputSocket,
-                PcapNgWriter.SessionCapture sessionCapture) {
+        private StreamTap(Direction direction, Socket inputSocket, Socket outputSocket,
+                TrafficObserver observer) {
             this.direction = direction;
-            this.clientToDestination = clientToDestination;
             this.inputSocket = inputSocket;
             this.outputSocket = outputSocket;
-            this.sessionCapture = sessionCapture;
+            this.observer = observer;
         }
 
         @Override
@@ -115,21 +115,21 @@ final class TcpTap implements Runnable {
                     if (bytesRead == 0) {
                         continue;
                     }
-                    recordObservedData(buffer, bytesRead);
+                    observer.onData(direction, buffer, 0, bytesRead);
                     outputStream.write(buffer, 0, bytesRead);
                     bytesTransferred += bytesRead;
                 }
                 outputStream.flush();
-                recordEof();
+                observer.onEof(direction);
                 shutdownOutputQuietly(outputSocket);
                 endReason = "EOF";
             } catch (IOException e) {
-                recordError();
+                observer.onError(direction);
                 endReason = "IO_ERROR:" + e.getClass().getSimpleName();
                 out.printf(Locale.ROOT,
                         "#%06d %s ERROR %s: %s%n",
                         sessionId,
-                        direction,
+                        direction.label(),
                         e.getClass().getSimpleName(),
                         safeMessage(e));
                 closeQuietly(inputSocket);
@@ -143,39 +143,6 @@ final class TcpTap implements Runnable {
 
         private String getEndReason() {
             return endReason;
-        }
-
-        private void recordObservedData(byte[] buffer, int bytesRead) {
-            if (sessionCapture == null) {
-                return;
-            }
-            if (clientToDestination) {
-                sessionCapture.recordClientData(buffer, 0, bytesRead);
-            } else {
-                sessionCapture.recordDestinationData(buffer, 0, bytesRead);
-            }
-        }
-
-        private void recordEof() {
-            if (sessionCapture == null) {
-                return;
-            }
-            if (clientToDestination) {
-                sessionCapture.recordClientEof();
-            } else {
-                sessionCapture.recordDestinationEof();
-            }
-        }
-
-        private void recordError() {
-            if (sessionCapture == null) {
-                return;
-            }
-            if (clientToDestination) {
-                sessionCapture.recordClientError();
-            } else {
-                sessionCapture.recordDestinationError();
-            }
         }
 
         private void shutdownOutputQuietly(Socket socket) {
