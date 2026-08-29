@@ -20,6 +20,8 @@ import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.Locale;
 
+import com.github.rhktrth.tcptap.TrafficObserver.Direction;
+
 final class PcapNgWriter implements Closeable {
     private static final int SECTION_HEADER_BLOCK = 0x0A0D0D0A;
     private static final int INTERFACE_DESCRIPTION_BLOCK = 0x00000001;
@@ -327,7 +329,7 @@ final class PcapNgWriter implements Closeable {
         }
     }
 
-    final class SessionCapture {
+    final class SessionCapture implements TrafficObserver {
         private static final long UINT32_MASK = 0xffffffffL;
 
         private final long sessionId;
@@ -365,6 +367,48 @@ final class PcapNgWriter implements Closeable {
 
             clientSequence = add32(clientInitial, 1);
             destinationSequence = add32(destinationInitial, 1);
+        }
+
+        @Override
+        public void onData(Direction direction, byte[] data, int offset, int length) {
+            switch (direction) {
+                case CLIENT_TO_DESTINATION:
+                    recordClientData(data, offset, length);
+                    break;
+                case DESTINATION_TO_CLIENT:
+                    recordDestinationData(data, offset, length);
+                    break;
+                default:
+                    throw new AssertionError(direction);
+            }
+        }
+
+        @Override
+        public void onEof(Direction direction) {
+            switch (direction) {
+                case CLIENT_TO_DESTINATION:
+                    recordClientEof();
+                    break;
+                case DESTINATION_TO_CLIENT:
+                    recordDestinationEof();
+                    break;
+                default:
+                    throw new AssertionError(direction);
+            }
+        }
+
+        @Override
+        public void onError(Direction direction) {
+            switch (direction) {
+                case CLIENT_TO_DESTINATION:
+                    recordClientError();
+                    break;
+                case DESTINATION_TO_CLIENT:
+                    recordDestinationError();
+                    break;
+                default:
+                    throw new AssertionError(direction);
+            }
         }
 
         synchronized void recordClientData(byte[] data, int offset, int length) {
