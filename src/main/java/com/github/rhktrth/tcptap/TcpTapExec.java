@@ -197,16 +197,21 @@ public final class TcpTapExec implements Callable<Integer> {
                     sessionId,
                     formatEndpoint(destinationSocket.getRemoteSocketAddress()),
                     connectMillis);
-            PcapNgWriter.SessionCapture sessionCapture = captureWriter == null
-                    ? null
-                    : captureWriter.startSession(sessionId, clientSocket, destinationSocket);
+            TrafficObserver observer = NoopTrafficObserver.INSTANCE;
+            if (captureWriter != null) {
+                PcapNgWriter.SessionCapture sessionCapture = captureWriter.startSession(
+                        sessionId, clientSocket, destinationSocket);
+                if (sessionCapture != null) {
+                    observer = sessionCapture;
+                }
+            }
             new TcpTap(
                     sessionId,
                     clientSocket,
                     destinationSocket,
                     startedNanos,
                     standardOut,
-                    sessionCapture).run();
+                    observer).run();
         } catch (IOException e) {
             double connectMillis = (System.nanoTime() - connectStartedNanos) / 1_000_000.0;
             if (captureWriter != null) {
