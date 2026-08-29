@@ -51,7 +51,10 @@ TcpTap は小規模な Java CLI として、次の方針を採用します。
 - 接続確立後のクライアント→中継先／中継先→クライアントの中継は、独立して進行できる構造とする。
 - アプリケーションプロトコルは解釈せず、バイトストリームとして扱う。
 - 一方向の処理は、中継とその場での観測をまとめた `StreamTap` として扱う。
+- 中継処理は pcapng の実装詳細を知らず、方向付きの `TrafficObserver` へ観測事実だけを同期通知する。
+- キャプチャを使用しない場合も `NoopTrafficObserver` を利用し、中継処理にキャプチャ有無の分岐を持ち込まない。
 - キャプチャは中継の補助機能とし、キャプチャ障害を中継障害に変換しない。
+- pcapng の byte-level serialization と擬似 TCP セッション状態を分離する。
 - 擬似キャプチャの状態はセッションごとに分離する。
 - JRE 8 互換性と小さな実行時依存関係を維持する。
 - 実装詳細を必要以上に仕様化せず、責務・ライフサイクル・並行処理・障害の分離を設計上の契約とする。
@@ -78,23 +81,38 @@ TcpTap は小規模な Java CLI として、次の方針を採用します。
            +-------------+     +-------------+
            |  StreamTap  |     |  StreamTap  |
            |    C -> D   |     |    D -> C   |
-           +-------------+     +-------------+
+           +------+------+     +------+------+
                   |                   |
                   +---------+---------+
                             |
-                            v
-                 +----------------------+
-                 |    PcapNgWriter      |
-                 | プロセス共通の書込み |
-                 +----------------------+
+                    TrafficObserver
+                            |
+                +-----------+-----------+
+                |                       |
+                v                       v
+      NoopTrafficObserver      PcapNgWriter.SessionCapture
+                                        |
+                                        v
+                              SyntheticTcpSession
+                                        |
+                                        v
+                                  PcapNgEncoder
+                                        |
+                                        v
+                                     pcapng
 ```
+
+`PcapNgWriter` は `TcpTapExec` から見たキャプチャ機能の Facade として、`SessionCapture` の生成、`CONNECT_ERROR` 診断イベントの構築、キャプチャ全体の close を調整します。
 
 ### 2.3 依存方向
 
 - `TcpTapExec` は CLI 解析、待受処理、セッションの振分け、プロセス共通のキャプチャライフサイクルを調整する。
 - `TcpTap` は接続済みセッションを所有し、方向別の `StreamTap` を開始・終了する。
-- `StreamTap` は一方向のネットワークバイトストリームを中継し、入力から直接観測したデータと EOF／I/O エラーをその場でキャプチャへ通知する。
-- `PcapNgWriter` はネットワーク中継へ依存せず、渡された観測事実を pcapng として記録する。
+- `StreamTap` は一方向のネットワークバイトストリームを中継し、入力から直接観測したデータと EOF／I/O エラーを `TrafficObserver` へ通知する。
+- `TrafficObserver` は観測事実の通知境界であり、pcapng、擬似 TCP、ファイル書込みの詳細を中継側へ公開しない。
+- `PcapNgWriter.SessionCapture` は `TrafficObserver` を実装し、通知を `SyntheticTcpSession` へ委譲する。
+- `SyntheticTcpSession` はセッション単位の擬似 TCP 状態と packet 構築を担当し、生成した packet を `PcapNgEncoder` へ渡す。
+- `PcapNgEncoder` はプロセス共有の pcapng 出力、block serialization、書込みの直列化、稼働中の書込み失敗の隔離を担当する。
 - キャプチャ処理で発生した稼働中の書込み失敗を、中継処理へ再送出しない。
 
 ## 3. パッケージ・コンポーネント・クラス設計
@@ -103,12 +121,12 @@ TcpTap は小規模な Java CLI として、次の方針を採用します。
 
 | 項目 | 内容 |
 | --- | --- |
-| 目的 | プロセス管理、セッション管理、一方向中継、pcapng 書込み、セッション別キャプチャ状態の責務を分離する。 |
+| 目的 | プロセス管理、セッション管理、一方向中継、観測通知、pcapng 書込み、セッション別擬似 TCP 状態の責務を分離する。 |
 | 入力・前提 | 外部仕様で定義された CLI、待受／接続、中継、観測、キャプチャ契約。 |
 | 処理・規則 | 各コンポーネントは所有する責務とライフサイクルを越えて処理を抱え込まない。中継とキャプチャの障害境界を維持する。 |
 | 出力・結果 | 明確な依存方向、セッション単位の所有関係、方向別中継処理、プロセス共有のキャプチャ書込み構造。 |
 | 異常系 | キャプチャ内部の障害をネットワーク中継へ再送出しない。セッション障害を待受処理へ伝播させない。 |
-| 関連仕様 ID | `INT-CMP-001`..`INT-CMP-005` |
+| 関連仕様 ID | `INT-CMP-001`..`INT-CMP-007` |
 
 ### 3.1 パッケージ構成
 
@@ -118,7 +136,10 @@ TcpTap は小規模な Java CLI として、次の方針を採用します。
 com.github.rhktrth.tcptap
   ├─ TcpTapExec.java
   ├─ TcpTap.java
-  └─ PcapNgWriter.java
+  ├─ TrafficObserver.java
+  ├─ PcapNgWriter.java
+  ├─ PcapNgEncoder.java
+  └─ SyntheticTcpSession.java
 ```
 
 TcpTap の規模では、パッケージを機械的に細分化しません。責務分離上の明確な必要性が生じた場合だけ、パッケージ分割を検討します。
@@ -129,21 +150,25 @@ TcpTap の規模では、パッケージを機械的に細分化しません。�
 | --- | --- | --- |
 | `INT-CMP-001` | `TcpTapExec` | CLI の解析／入力検証、待受ソケットのバインド／接続受付ループ、セッション ID 採番、中継先への接続、セッションの振分け、プロセス全体のキャプチャライフサイクル、起動／プロセス全体のエラー処理 |
 | `INT-CMP-002` | `TcpTap` | 中継先へ接続済みの1セッションのソケット所有、双方向処理の開始・待機、最終後始末、終了時の要約 |
-| `INT-CMP-003` | `TcpTap.StreamTap` | 一方向のストリーム中継、入力から観測したデータのキャプチャ通知、書込み成功バイト数、EOF／I/O エラー処理 |
-| `INT-CMP-004` | `PcapNgWriter` | プロセス共通の pcapng 出力、ブロック書込みの直列化、再構成用／診断用インターフェース管理、キャプチャ障害の分離 |
-| `INT-CMP-005` | `PcapNgWriter.SessionCapture` | 1セッションの擬似 TCP エンドポイント／シーケンス／確認応答／方向別終了状態 |
+| `INT-CMP-003` | `TcpTap.StreamTap` | 一方向のストリーム中継、入力から観測したデータ／EOF／I/O エラーの Observer 通知、書込み成功バイト数の管理 |
+| `INT-CMP-004` | `PcapNgWriter` | キャプチャ機能の Facade。プロセス全体のキャプチャライフサイクル、セッションキャプチャ生成、接続失敗診断イベントの構築 |
+| `INT-CMP-005` | `SyntheticTcpSession` | 1セッションの擬似 TCP エンドポイント／シーケンス／確認応答／IPv4 packet ID／方向別終了状態と IPv4／IPv6 packet 構築 |
+| `INT-CMP-006` | `TrafficObserver` / `NoopTrafficObserver` | 中継処理とキャプチャ実装の通知境界。方向付き data／EOF／error 通知と、キャプチャ無効時の Null Object |
+| `INT-CMP-007` | `PcapNgEncoder` | pcapng Section Header／Interface Description／Enhanced Packet Block の serialization、プロセス共有出力の直列化、稼働中書込み失敗の隔離 |
 
-クラス名そのものは外部契約ではありませんが、この責務分離を変更する場合は本書を先に見直します。
+`PcapNgWriter.SessionCapture` は `TrafficObserver` を実装する薄い Facade であり、擬似 TCP の mutable state 自体は `SyntheticTcpSession` が所有します。
 
 ### 3.3 コンポーネント別の責務・入出力
 
 | コンポーネント | 入力・前提 | 処理・責務 | 出力・結果 | 異常系・制約 | ID |
 | --- | --- | --- | --- | --- | --- |
-| `TcpTapExec` | CLI 引数、標準入出力、待受設定、中継先設定、任意のキャプチャ設定 | picocli による CLI 解析／使用方法生成、固有オプションの入力検証、`ServerSocket` のバインド、接続受付、セッション ID 採番、セッションスレッド生成、中継先接続、`PcapNgWriter` のプロセス全体ライフサイクル管理 | 待受状態、セッション開始、プロセス全体の標準出力／標準エラー | CLI 解析とネットワーク入出力を分離し、解析を待受処理なしで単体テストできる状態を維持する | `INT-CMP-001` |
-| `TcpTap` | 接続済みクライアント側／中継先側ソケット、セッション ID、任意のセッションキャプチャ | 1セッションのソケット所有、2方向の `StreamTap` の生成・開始、終了待機、後始末、転送済みバイト数／終了理由の集約 | セッション終了、終了時要約 | セッション障害を待受処理へ伝播させない。最終的なソケット所有者として後始末する | `INT-CMP-002` |
-| `TcpTap.StreamTap` | 一方向の `InputStream` / `OutputStream`、対応ソケット、任意のキャプチャ通知先 | `read -> capture -> write`、書込み成功バイト数の計測、EOF／ハーフクローズ、`IOException` 処理 | 方向別の転送済みバイト数、終了理由、観測データ／EOF／エラーのキャプチャ通知 | キャプチャのためだけの追加スレッド、キュー、汎用イベント基盤を設けない | `INT-CMP-003` |
-| `PcapNgWriter` | 観測済みストリームデータ、セッションイベント、診断イベント | pcapng 新規作成、Section Header／Interface Description 初期化、Enhanced Packet Block 生成、複数セッション書込みの直列化 | プロセス共通の pcapng 出力 | 稼働中の書込み失敗を内部隔離し、中継へ例外として返さない | `INT-CMP-004` |
-| `PcapNgWriter.SessionCapture` | 1セッションのエンドポイントと方向別イベント | 擬似 TCP のアドレス表現、シーケンス／確認応答、IPv4 パケット ID、FIN／RST 終了状態の管理 | セッション内で一貫した擬似 TCP 状態 | 終了済み方向への重複 FIN／RST／データイベントを生成しない | `INT-CMP-005` |
+| `TcpTapExec` | CLI 引数、標準入出力、待受設定、中継先設定、任意のキャプチャ設定 | picocli による CLI 解析／使用方法生成、入力検証、`ServerSocket` のバインド、接続受付、セッション ID 採番、セッションスレッド生成、中継先接続、`PcapNgWriter` のライフサイクル管理 | 待受状態、セッション開始、プロセス全体の標準出力／標準エラー | CLI 解析とネットワーク入出力を分離し、解析を待受処理なしで単体テストできる状態を維持する | `INT-CMP-001` |
+| `TcpTap` | 接続済みクライアント側／中継先側ソケット、セッション ID、`TrafficObserver` | 1セッションのソケット所有、2方向の `StreamTap` の生成・開始、終了待機、後始末、転送済みバイト数／終了理由の集約 | セッション終了、終了時要約 | セッション障害を待受処理へ伝播させない。最終的なソケット所有者として後始末する | `INT-CMP-002` |
+| `TcpTap.StreamTap` | 一方向の `InputStream` / `OutputStream`、対応ソケット、`TrafficObserver` | `read -> observer -> write`、書込み成功バイト数の計測、EOF／ハーフクローズ、`IOException` 処理 | 方向別の転送済みバイト数、終了理由、観測 data／EOF／error 通知 | Observer のためだけの追加スレッドやキューを設けない | `INT-CMP-003`, `INT-CMP-006` |
+| `TrafficObserver` | 方向と観測イベント | pcapng 等の具体形式に依存しない同期通知 | capture 実装または Null Object へイベントを引き渡す | 通知自体に再試行、キュー、独立ライフサイクルを持たせない | `INT-CMP-006` |
+| `PcapNgWriter` | ファイルパス、接続済みエンドポイント、接続失敗情報 | `PcapNgEncoder` の生成／close、`SessionCapture` の生成、`CONNECT_ERROR` JSON／コメントの構築 | セッション Observer、診断イベント、プロセス共通キャプチャのライフサイクル | 稼働中の encoder 書込み失敗を中継へ返さない | `INT-CMP-004` |
+| `SyntheticTcpSession` | 1セッションのエンドポイントと方向別イベント | 擬似 TCP 状態管理、IPv4／IPv6 packet と checksum の生成 | セッション内で一貫した擬似 TCP packet | 終了済み方向への重複 FIN／RST／data を生成しない | `INT-CMP-005` |
+| `PcapNgEncoder` | 再構成 packet、診断 payload／comment | pcapng 初期化、block serialization、複数セッション書込みの直列化 | プロセス共通の pcapng 出力 | 初期化失敗は呼出元へ返す。稼働中書込み失敗は内部隔離する | `INT-CMP-007`, `INT-CAP-001` |
 
 ## 4. 処理設計
 
@@ -153,7 +178,7 @@ TcpTap の規模では、パッケージを機械的に細分化しません。�
 | --- | --- |
 | 目的 | 起動、接続受付、中継先接続、双方向中継、EOF、I/O エラー、セッション終了の処理順序と責務境界を定義する。 |
 | 入力・前提 | 解析済み設定、待受ソケット、クライアント接続、任意のキャプチャ書込み先。 |
-| 処理・規則 | 待受バインドをキャプチャ初期化より先に行う。接続受付後の中継先接続を待受スレッドから分離する。中継は `read -> capture -> write` を維持する。 |
+| 処理・規則 | 待受バインドをキャプチャ初期化より先に行う。接続受付後の中継先接続を待受スレッドから分離する。中継は `read -> observer -> write` を維持する。 |
 | 出力・結果 | 接続済みセッション、方向別転送結果、EOF／エラー状態、終了時要約。 |
 | 異常系 | 中継先接続失敗はセッション内で捕捉。中継 I/O エラーは共有ソケットを閉じて当該セッションを終了する。 |
 | 関連仕様 ID | `INT-LIFE-001`, `INT-ERR-001`, `INT-RELAY-001`, `INT-RELAY-002` |
@@ -165,8 +190,8 @@ TcpTap の規模では、パッケージを機械的に細分化しません。�
 | 起動 | CLI 引数 | 解析／検証 → 待受バインド → 必要ならキャプチャ初期化 → 状態出力 → accept ループ | 待受開始 | CLI／バインド／初期化失敗はプロセス起動失敗 | `INT-LIFE-001` |
 | 接続受付 | クライアント TCP 接続 | セッション ID 採番 → セッションスレッド開始 | 待受スレッドは次の accept へ戻る | セッション側の失敗を待受へ伝播させない | `INT-CONC-001` |
 | 中継先接続 | 受付済みクライアントソケット、固定中継先、タイムアウト | 中継先ソケット生成 → connect → 所要時間計測 → 成功後にキャプチャセッション開始 | 接続済みセッション | 失敗時は診断通知、ソケット後始末、セッション終了 | `INT-ERR-001` |
-| 双方向中継 | 接続済み2ソケット | 2本の `StreamTap` を実行し `read -> capture -> write` | 方向別バイト数、終了理由 | I/O エラーは当該セッションを終了 | `INT-RELAY-001` |
-| EOF | 一方向の入力 EOF | flush → EOF キャプチャ → `shutdownOutput()` | 当該方向 `EOF`、逆方向は継続 | `shutdownOutput()` 失敗は追加のセッション障害へ昇格させない | `INT-RELAY-002` |
+| 双方向中継 | 接続済み2ソケット | 2本の `StreamTap` を実行し `read -> observer -> write` | 方向別バイト数、終了理由 | I/O エラーは当該セッションを終了 | `INT-RELAY-001` |
+| EOF | 一方向の入力 EOF | flush → EOF 通知 → `shutdownOutput()` | 当該方向 `EOF`、逆方向は継続 | `shutdownOutput()` 失敗は追加のセッション障害へ昇格させない | `INT-RELAY-002` |
 | セッション終了 | 両方向の中継処理終了 | `join()` 後に最終後始末、要約生成 | `CLOSE` 要約 | 割込み時は割込み状態を復元し `finally` でソケットを閉じる | `INT-CMP-002`, `INT-LIFE-002` |
 
 ### 4.2 起動処理 — `INT-LIFE-001`
@@ -191,8 +216,6 @@ LISTEN 状態を出力
         v
 接続受付ループ
 ```
-
-処理順序は次のとおりです。
 
 1. picocli で CLI を解析し、入力を検証する。
 2. `ServerSocket` を生成し、指定されたローカルアドレス／ポートへバインドする。
@@ -227,7 +250,8 @@ LISTEN 状態を出力
 - 中継先側ソケットは、セッションスレッド内で生成する。
 - 中継先への接続には、設定されたタイムアウトを使用する。
 - 接続成功までの時間は `System.nanoTime()` の差分で計測する。
-- 接続成功後にだけ、擬似キャプチャ用セッションを開始する。
+- 接続成功後にだけ `PcapNgWriter` から擬似キャプチャ用 `TrafficObserver` を取得する。
+- キャプチャが無効、またはエンドポイントからキャプチャセッションを構成できない場合は `NoopTrafficObserver` を使用する。
 
 #### 接続失敗 — `INT-ERR-001`
 
@@ -236,7 +260,7 @@ LISTEN 状態を出力
 1. キャプチャが有効なら、ソケットを閉じる前に `CONNECT_ERROR` 診断イベントを通知する。
 2. クライアント側／中継先側ソケットを、可能な範囲で閉じる。
 3. 失敗を待受スレッドへ伝播させない。
-4. 擬似パケットの状態は生成しない。
+4. 擬似 TCP セッション状態は生成しない。
 
 ### 4.5 双方向中継 — `INT-RELAY-001`
 
@@ -246,12 +270,14 @@ LISTEN 状態を出力
 
 1. 入力側ソケットの `InputStream` からバイト列を読む。
 2. 読取りバイト数が 0 の場合は何も中継せず、次の読取りへ進む。
-3. 読取りバイト数が正の場合は、その時点で TcpTap が観測したデータとしてキャプチャへデータイベントを通知する。
+3. 読取りバイト数が正の場合は、その時点で TcpTap が観測した data として、方向を付けて `TrafficObserver` へ同期通知する。
 4. 出力側ソケットの `OutputStream` へ同じバイト列を書き込む。
 5. `write()` が正常完了したバイト数だけ、転送済みバイト数に加算する。
 6. EOF または I/O エラーまで繰り返す。
 
-キャプチャ通知は `write()` より前に行います。したがって、入力から読み取った後の `write()` が失敗した場合も、そのバイト列は TcpTap が観測したデータとしてキャプチャに残り、転送済みバイト数には加算されません。
+Observer 通知は `write()` より前に行います。したがって、入力から読み取った後の `write()` が失敗した場合も、そのバイト列は TcpTap が観測したデータとしてキャプチャに残り、転送済みバイト数には加算されません。
+
+`TrafficObserver` は同じ中継スレッドから同期的に呼び出します。キャプチャのためだけのキュー、追加スレッド、非同期イベント基盤は設けません。
 
 読取りバッファの大きさは実装詳細であり、読取り単位を TCP パケット／アプリケーションメッセージ／キャプチャパケットの意味的な境界にしてはなりません。
 
@@ -260,7 +286,7 @@ LISTEN 状態を出力
 入力ストリームが EOF になった場合は、次の順序を基本とします。
 
 1. 出力ストリームをフラッシュする。
-2. キャプチャが有効なら、当該方向の EOF イベントを記録する。
+2. 当該方向の EOF を `TrafficObserver` へ通知する。キャプチャ無効時は Null Object が何もしない。
 3. 出力側ソケット全体を閉じず、`shutdownOutput()` する。
 4. 当該方向の終了理由を `EOF` とする。
 
@@ -270,7 +296,7 @@ LISTEN 状態を出力
 
 読取り／書込みなどで `IOException` が発生した場合は、次を行います。
 
-1. キャプチャが有効なら、当該方向のエラーイベントを擬似通信上へ記録する。
+1. 当該方向の error を `TrafficObserver` へ通知する。pcapng キャプチャでは擬似通信上の RST として記録し、Null Object では何もしない。
 2. 終了理由を `IO_ERROR:<ExceptionSimpleName>` とする。
 3. 当該方向のエラーを出力する。
 4. 入力側ソケットと出力側ソケットを閉じる。
@@ -303,7 +329,8 @@ LISTEN 状態を出力
 | セッション ID | プロセス全体 | 受付済みセッションを識別する正の番号 | アトミックカウンターから採番し、受け付けたセッション間で重複させない | `INT-CMP-001` |
 | セッション状態 | 1セッション | `ACCEPTED` → `CONNECTING` → `CONNECTED` → `RELAYING` → 終了 | 接続失敗は診断後に END。接続成功後は両方向終了を待って CLOSE 要約へ進む | `INT-CMP-002`, `INT-ERR-001` |
 | 方向別中継状態 | 1 `StreamTap` | 転送済みバイト数、終了理由 | バイト数は `write()` 成功分だけ。終了理由は `EOF` または `IO_ERROR:<ExceptionSimpleName>` | `INT-CMP-003`, `INT-RELAY-001` |
-| 擬似キャプチャ状態 | 1セッション | エンドポイント、アドレス表現、擬似シーケンス／ACK、IPv4 packet ID、方向別 FIN／RST 状態 | セッション間で共有しない。終了済み方向に重複イベントを出さない | `INT-CMP-005` |
+| 擬似キャプチャ状態 | 1 `SyntheticTcpSession` | エンドポイント、アドレス表現、擬似 sequence／ACK、IPv4 packet ID、方向別 FIN／RST 状態 | セッション間で共有しない。終了済み方向に重複イベントを出さない | `INT-CMP-005` |
+| pcapng 書込み状態 | プロセス全体 | 出力ストリーム、稼働中書込み失敗フラグ | block 単位で直列化し、失敗後は追加書込みを無視する | `INT-CMP-007`, `INT-CAP-001`, `INT-ERR-002` |
 
 ### 5.2 セッション状態
 
@@ -336,7 +363,7 @@ CLOSE 要約
 
 ### 5.3 擬似キャプチャ状態 — `INT-CMP-005`
 
-`SessionCapture` は、セッションごとに次を保持します。
+`SyntheticTcpSession` は、セッションごとに次を保持します。
 
 - クライアント／中継先のアドレスとポート
 - IPv4／IPv6 の表現方式
@@ -346,6 +373,8 @@ CLOSE 要約
 
 終了済みの方向へ、重複した FIN／RST／データイベントを出力しません。
 
+`PcapNgWriter.SessionCapture` はこの状態を重複所有せず、`TrafficObserver` と既存の package 内テスト境界から `SyntheticTcpSession` へ処理を委譲します。
+
 ## 6. 並行処理・同期設計
 
 ### 設計単位サマリ
@@ -353,7 +382,7 @@ CLOSE 要約
 | 項目 | 内容 |
 | --- | --- |
 | 目的 | 待受処理、セッション接続処理、双方向中継を独立して進行させ、共有状態を必要最小限の同期で保護する。 |
-| 入力・前提 | 複数クライアント接続、1セッション内の2方向中継、全セッション共有の `PcapNgWriter`。 |
+| 入力・前提 | 複数クライアント接続、1セッション内の2方向中継、全セッション共有のキャプチャ出力。 |
 | 処理・規則 | 待受スレッドは中継先接続を待たない。セッション接続後に2本の中継スレッドを開始し `join()` する。共有書込みとセッションキャプチャ状態だけを同期する。 |
 | 出力・結果 | 後続 accept の継続、独立した C->D / D->C 中継、破損しない pcapng ブロック書込み。 |
 | 異常系 | スレッドプール、接続キュー、全体並行数制限、負荷制御は持たない。高密度プロキシを目的としない。 |
@@ -373,6 +402,7 @@ CLOSE 要約
 - 待受スレッドは、中継先への接続を行わない。
 - 中継先への接続中は、セッションスレッド1本を使用する。
 - 中継先への接続後は、セッションスレッドが2本の中継スレッドを開始し、両方を `join()` する。
+- `TrafficObserver` 通知のための追加スレッドは作らない。
 - スレッドプール、接続キュー、全体の並行数制限、負荷制御方針は持たない。
 - Java 8 の標準スレッドを使用する現在の構成は、高密度プロキシを目的としない。
 
@@ -381,13 +411,14 @@ CLOSE 要約
 | 共有対象 | 範囲 | 同期方針 |
 | --- | --- | --- |
 | セッション ID カウンター | プロセス全体 | アトミックカウンター |
-| `PcapNgWriter` | プロセス全体／全セッション共有 | 書込み用ロックでブロック書込みを直列化 |
-| `SessionCapture` | 1セッション／2方向で共有 | 状態を変更する操作を同期化 |
+| `PcapNgEncoder` | プロセス全体／全セッション共有 | Enhanced Packet Block の書込み操作を同期化して直列化 |
+| `SyntheticTcpSession` | 1セッション／2方向で共有 | sequence、ACK、FIN／RST 等を変更する操作を同期化 |
+| `TrafficObserver` | 1セッション／2方向で共有 | 独自キューを持たず、呼出し先の同期規則に従う |
 | ソケット対 | 1セッション／2方向で共有 | 方向ごとに読取り／書込み。I/O エラー時は閉じることで双方を終了 |
 
 ### 6.3 キャプチャ書込みの直列化 — `INT-CAP-001`
 
-擬似パケットと診断イベントの Enhanced Packet Block への書込みは、同じ書込み用ロックで直列化し、複数セッションのブロックが相互に混ざらないようにします。
+擬似 packet と診断イベントの Enhanced Packet Block への書込みは、`PcapNgEncoder` の同じ同期境界で直列化し、複数セッションの block が相互に混ざらないようにします。
 
 ## 7. 入出力・通信・ファイル設計
 
@@ -395,7 +426,7 @@ CLOSE 要約
 
 | 項目 | 内容 |
 | --- | --- |
-| 目的 | CLI 解析、TCP ストリーム入出力、pcapng 初期化／書込み、診断イベントの内部実現方式を定義する。 |
+| 目的 | CLI 解析、TCP ストリーム入出力、pcapng 初期化／書込み、擬似 TCP packet、診断イベントの内部実現方式を定義する。 |
 | 入力・前提 | CLI 文字列、接続済みソケット、セッションの観測イベント、キャプチャファイルパス。 |
 | 処理・規則 | CLI の一般解析は picocli に委ねる。TCP は `ServerSocket` / `InputStream` / `OutputStream` を使用する。pcapng は `CREATE_NEW` で生成し2インターフェースを初期化する。 |
 | 出力・結果 | 検証済み設定、双方向 TCP 中継、再構成ストリーム／診断イベントを含む pcapng。 |
@@ -425,7 +456,7 @@ CLI の解析、使用方法生成、オプション重複・未知オプショ�
 
 ### 7.3 pcapng 書込み処理のライフサイクル
 
-`PcapNgWriter` は対象ファイルを `CREATE_NEW` で開き、次を初期化します。
+`PcapNgWriter` の生成時に `PcapNgEncoder` が対象ファイルを `CREATE_NEW` で開き、次を初期化します。
 
 | 順序 | 初期化対象 | 内容 |
 | ---: | --- | --- |
@@ -434,11 +465,11 @@ CLI の解析、使用方法生成、オプション重複・未知オプショ�
 | 3 | 診断イベント用 Interface Description Block | `LINKTYPE_USER0`、インターフェース ID `1`、`tcptap-diagnostics` |
 | 4 | 出力 | 初期ブロックを書き出してフラッシュ |
 
-途中で初期化に失敗した場合は、出力ストリームを閉じて例外を呼出元へ返します。既存ファイルを切り詰めるモードは持ちません。
+途中で初期化に失敗した場合は、`PcapNgEncoder` が出力ストリームを閉じて例外を `PcapNgWriter` 経由で呼出元へ返します。既存ファイルを切り詰めるモードは持ちません。
 
 ### 7.4 再構成ストリームの生成
 
-セッションのキャプチャ開始時に、論理的な TCP 通信として擬似3ウェイハンドシェイクを生成します。
+接続成功後に `PcapNgWriter` が `SyntheticTcpSession` を作成できた場合、論理的な TCP 通信として擬似3ウェイハンドシェイクを生成します。
 
 ```text
 client      destination
@@ -458,11 +489,12 @@ client      destination
 
 - 初期シーケンス番号は擬似的に生成する。
 - 具体的な初期シーケンス番号の生成式は、非公開の実装詳細とする。
-- クライアント／中継先がともに IPv4 なら IPv4 パケット、いずれかが IPv6 なら IPv6 パケットとする。
+- クライアント／中継先がともに IPv4 なら IPv4 packet、いずれかが IPv6 なら IPv6 packet とする。
 - IPv6 通信内の IPv4 エンドポイントは、IPv4-mapped IPv6 アドレスへ変換する。
-- IPv4 ヘッダーのチェックサム、TCP チェックサム、IPv6 TCP チェックサムを生成内容から計算する。
+- IPv4 ヘッダーの checksum、TCP checksum、IPv6 TCP checksum を生成内容から計算する。
+- `SyntheticTcpSession` は生成した packet bytes を `PcapNgEncoder` へ渡し、pcapng block layout 自体は扱わない。
 
-再構成ストリームのデータイベントは反対側への書込み成功を表すものではありません。観測後の `write()` が失敗した場合は、観測済みペイロードの後に当該方向の `RST+ACK` が記録されます。
+再構成ストリームの data イベントは反対側への書込み成功を表すものではありません。観測後の `write()` が失敗した場合は、観測済みペイロードの後に当該方向の `RST+ACK` が記録されます。
 
 ### 7.5 診断イベント — `INT-CAP-002`
 
@@ -476,6 +508,8 @@ client      destination
 | 中継先 | 設定された中継先。CR / LF 無害化後、UTF-16 code unit 数 4096 を上限とし、超過時は先頭 4093 code unit と `...` へ切り詰める |
 | 例外 | 例外の単純名 |
 | メッセージ | CR / LF 無害化後、UTF-16 code unit 数 4096 を上限とし、超過時は先頭 4093 code unit と `...` へ切り詰める |
+
+`PcapNgWriter` が JSON payload と packet comment を構築し、`PcapNgEncoder` が診断インターフェースの Enhanced Packet Block として serialization します。
 
 切り詰めは JSON エスケープ前に行い、同じ切り詰め済み値を JSON とパケットコメントに使用します。データは UTF-8 JSON とし、同じ Enhanced Packet Block に人間が読めるパケットコメントを付けます。
 
@@ -502,19 +536,21 @@ Java ソケット API／TcpTap が直接観測した事実だけを記録し、`
 | 待受処理／キャプチャの初期化失敗 | プロセス起動 | 起動失敗として終了コード 1 |
 | 中継先への接続失敗 | セッション | 当該セッションだけを終了し、待受処理を継続 |
 | 中継中の I/O エラー | セッション | 当該セッションのソケットを終了し、待受処理を継続 |
-| 稼働中のキャプチャ書込み失敗 | キャプチャ処理 | キャプチャを失敗状態にし、中継を継続 |
+| 稼働中のキャプチャ書込み失敗 | キャプチャ処理 | `PcapNgEncoder` を失敗状態にし、中継を継続 |
 
 ### 8.2 キャプチャ障害の分離 — `INT-ERR-002`
 
-書込み失敗が一度発生した場合は、書込み処理を失敗状態にし、それ以降のキャプチャ書込みを無視します。
+`PcapNgEncoder` で書込み失敗が一度発生した場合は、encoder を失敗状態にし、それ以降のキャプチャ書込みを無視します。
 
-キャプチャ障害を、中継処理へ例外として再送出しません。
+この失敗は `TrafficObserver` → `SessionCapture` → `SyntheticTcpSession` の呼出し元へ例外として再送出さず、中継処理を継続します。
+
+初期化中の失敗は別であり、起動時のキャプチャ作成失敗として呼出元へ `IOException` を返します。
 
 ### 8.3 観測・ログ生成
 
 | 情報 | 時刻／値の基準 |
 | --- | --- |
-| イベント時刻 | `Instant.now()` |
+| イベント時刻 | `Instant.now()` 相当の epoch 時刻 |
 | 中継先への接続時間 | `System.nanoTime()` の差分 |
 | セッション継続時間 | `System.nanoTime()` の差分 |
 | 転送済みバイト数 | 各方向の `write()` 成功分 |
@@ -534,7 +570,7 @@ CLI／テストで差し替え可能な標準出力／標準エラーは `TcpTap
 | --- | --- |
 | 目的 | ソケット、ストリーム、キャプチャ書込み先、セッションキャプチャ状態の生成者・所有者・終了責務を一意にする。 |
 | 入力・前提 | 待受開始、クライアント受付、中継先接続、キャプチャ初期化、セッション開始／終了。 |
-| 処理・規則 | 接続成功後のセッションソケットは `TcpTap` が最終所有する。`PcapNgWriter` はプロセスに1つ、`SessionCapture` はセッション単位とする。 |
+| 処理・規則 | 接続成功後のセッションソケットは `TcpTap` が最終所有する。`PcapNgWriter`／`PcapNgEncoder` はプロセス単位、`SyntheticTcpSession` はセッション単位とする。 |
 | 出力・結果 | 正常／異常／割込みの各経路で閉じ忘れがない所有関係。 |
 | 異常系 | 接続失敗や初期化途中の失敗でも、生成済みリソースを可能な範囲で閉じる。 |
 | 関連仕様 ID | `INT-LIFE-001`, `INT-LIFE-002` |
@@ -547,8 +583,10 @@ CLI／テストで差し替え可能な標準出力／標準エラーは `TcpTap
 | 受け付けたクライアント側ソケット | セッション単位 | 接続失敗時、または `TcpTap` のセッション後始末 |
 | 中継先側ソケット | セッションスレッド／`TcpTap` | 接続失敗時、または `TcpTap` のセッション後始末 |
 | C->D／D->C ストリーム | 対応する `StreamTap` が利用 | ソケットのライフサイクルに従う |
-| `PcapNgWriter` | `TcpTapExec` | プロセス全体のキャプチャライフサイクル |
-| `SessionCapture` | `PcapNgWriter` が生成し、セッションで利用 | セッションの生存期間に従う。独立して閉じるリソースは持たない |
+| `PcapNgWriter` | `TcpTapExec` | プロセス全体のキャプチャライフサイクル。close を `PcapNgEncoder` へ委譲 |
+| `PcapNgEncoder` と出力ストリーム | `PcapNgWriter` | キャプチャ初期化からプロセス終了まで。初期化失敗時も生成済みストリームを閉じる |
+| `SessionCapture` / `SyntheticTcpSession` | `PcapNgWriter` がセッションごとに生成 | セッションの生存期間に従う。独立して閉じる I/O リソースは持たない |
+| `NoopTrafficObserver` | static singleton | I/O リソースを持たない |
 
 ### 9.2 セッションの後始末
 
@@ -559,7 +597,9 @@ CLI／テストで差し替え可能な標準出力／標準エラーは `TcpTap
 
 ### 9.3 キャプチャ用リソース
 
-`PcapNgWriter` はプロセスに1つだけ存在し、全セッションから共有します。初期化途中で失敗した場合は、出力ストリームを閉じて例外を呼出元へ返します。
+`PcapNgWriter` とその `PcapNgEncoder` はプロセスに1組だけ存在し、全セッションから共有します。初期化途中で失敗した場合は、encoder が出力ストリームを閉じて例外を呼出元へ返します。
+
+`SyntheticTcpSession` は共有 encoder への参照を持ちますが、ファイルやストリームを所有しません。
 
 ## 10. 依存関係・実行環境設計
 
@@ -608,12 +648,15 @@ CLI／テストで差し替え可能な標準出力／標準エラーは `TcpTap
 | EOF | EOF はソケット全体を閉じるのではなく、ハーフクローズとして反対側へ伝播できる構造にする。 | `INT-RELAY-002` |
 | 転送量 | 中継バイト数は反対側への書込み成功後のバイト列を基準にする。 | `INT-RELAY-001` |
 | 観測点 | キャプチャのペイロードは入力ストリームから正常に読み取って TcpTap が観測したバイト列を基準にし、反対側への書込み成功を条件にしない。 | `INT-RELAY-001` |
-| 中継構造 | `StreamTap` は `read -> capture -> write` を直接行い、キャプチャのためだけの仲介層を置かない。 | `INT-CMP-003` |
-| 共有書込み | キャプチャ書込み処理は複数セッションから安全に共有できる。 | `INT-CAP-001` |
+| 観測境界 | `StreamTap` は方向付き `TrafficObserver` に data／EOF／error を同期通知し、pcapng の具体型へ直接依存しない。 | `INT-CMP-003`, `INT-CMP-006` |
+| 中継構造 | Observer 通知は `read` と `write` の間で直接行い、キャプチャのためだけのキュー、別スレッド、非同期イベント基盤を置かない。 | `INT-CMP-003`, `INT-CMP-006` |
+| Null Object | キャプチャ無効時は `NoopTrafficObserver` を使用し、`StreamTap` 内でキャプチャ有無を分岐しない。 | `INT-CMP-006` |
+| 共有書込み | pcapng block 書込みは複数セッションから安全に共有できる。 | `INT-CMP-007`, `INT-CAP-001` |
 | 障害分離 | キャプチャ状態の障害を中継障害に変換しない。 | `INT-ERR-002` |
 | pcapng 構造 | 再構成ストリームと診断イベントを異なる pcapng インターフェースへ分離する。 | `INT-CAP-001`, `INT-CAP-002` |
 | 観測限界 | 中継先への接続失敗から未観測の実パケットを生成しない。 | `INT-CAP-002` |
-| 状態分離 | 擬似キャプチャ状態はセッションごとに分離する。 | `INT-CMP-005` |
+| 状態分離 | 擬似 TCP の mutable state は `SyntheticTcpSession` にセッション単位で分離する。 | `INT-CMP-005` |
+| serialization 分離 | 擬似 TCP packet 構築と pcapng block serialization を別責務とし、`PcapNgWriter` は Facade に留める。 | `INT-CMP-004`, `INT-CMP-005`, `INT-CMP-007` |
 | バッファ境界 | 読取りバッファの境界をパケット／メッセージ境界として意味付けしない。 | `INT-RELAY-001` |
 | テスト可能性 | CLI の解析とネットワーク入出力を分離し、CLI の契約をネットワーク起動なしでテストできるようにする。 | `INT-CMP-001` |
 
@@ -638,14 +681,14 @@ CLI／テストで差し替え可能な標準出力／標準エラーは `TcpTap
 | `EXT-CLI-001..003` | `AC-CLI-001` | `INT-CMP-001` | `TcpTapExecTest` の CLI 解析／実行テスト。指定エラーの終了コードとスタックトレース非表示を含む |
 | `EXT-NET-002` | `AC-NET-001` | `INT-LIFE-001`, `INT-CMP-001` | `TcpTapExecTest.listenerStartupFailureDoesNotCreateCaptureFile` |
 | `EXT-NET-003` | `AC-NET-002` | `INT-CONC-001` | `TcpTapExecTest.acceptsNextClientWhilePreviousDestinationConnectIsPending` で、中継先接続待ち中も後続接続を受け付けることを直接検証 |
-| `EXT-NET-004` | `AC-NET-002` | `INT-ERR-001`, `INT-CMP-001` | `TcpTapExecTest.continuesAcceptingAfterDestinationConnectFailure`, `destinationConnectFailureIsWrittenToDiagnosticCapture` で、接続失敗後の待受継続と診断イベントを検証 |
-| `EXT-RELAY-001` | `AC-RELAY-001`, `AC-CAP-005` | `INT-CMP-002`, `INT-CMP-003`, `INT-CONC-002`, `INT-RELAY-001` | `TcpTapTest.relaysBothDirectionsAndPropagatesHalfClose`, `TcpTapTest.capturesBytesObservedBeforeRelayWriteFails` |
-| `EXT-RELAY-002` | `AC-RELAY-001` | `INT-RELAY-002`, `INT-CMP-002` | `TcpTapTest.relaysBothDirectionsAndPropagatesHalfClose`, `TcpTapTest.captureWriteFailureDoesNotBreakRelay` |
-| `EXT-RELAY-003` | `AC-RELAY-002`, `AC-CAP-005` | `INT-CMP-002`, `INT-CMP-003`, `INT-LIFE-002` | `TcpTapTest.relayIoErrorTerminatesSessionAndRecordsReset`, `TcpTapTest.capturesBytesObservedBeforeRelayWriteFails` |
-| `EXT-FILE-001` | `AC-FILE-001` | `INT-LIFE-001`, `INT-CMP-004` | `TcpTapExecTest.existingCaptureFileIsNotOverwrittenAtStartup`, `PcapNgWriterTest.doesNotOverwriteExistingCaptureFile` |
-| `EXT-CAP-001` | `AC-CAP-001`, `AC-CAP-002`, `AC-CAP-004`, `AC-CAP-005` | `INT-CMP-004`, `INT-CMP-005`, `INT-CAP-001` | IPv4 のシーケンス／ACK／チェックサム、観測ストリームとキャプチャの結合、IPv6／IPv4-mapped IPv6、終了済み方向への重複イベント抑止を検証済み |
-| `EXT-CAP-002` | `AC-CAP-002` | `INT-ERR-001`, `INT-CAP-002` | `PcapNgWriterTest.writesConnectErrorAsDiagnosticEventWithPacketComment`, `sanitizesAndEscapesConnectErrorDiagnosticValues`, `TcpTapExecTest.destinationConnectFailureIsWrittenToDiagnosticCapture`, `diagnosticValuesKeep4096AndTruncateBeyondLimit` |
-| `EXT-CAP-003` | `AC-CAP-003` | `INT-ERR-002`, `INT-CMP-004` | `TcpTapTest.captureWriteFailureDoesNotBreakRelay` |
+| `EXT-NET-004` | `AC-NET-002` | `INT-ERR-001`, `INT-CMP-001`, `INT-CMP-004` | `TcpTapExecTest.continuesAcceptingAfterDestinationConnectFailure`, `destinationConnectFailureIsWrittenToDiagnosticCapture` で、接続失敗後の待受継続と診断イベントを検証 |
+| `EXT-RELAY-001` | `AC-RELAY-001`, `AC-CAP-005` | `INT-CMP-002`, `INT-CMP-003`, `INT-CMP-006`, `INT-CONC-002`, `INT-RELAY-001` | `TcpTapTest.relaysBothDirectionsAndPropagatesHalfClose`, `TcpTapTest.capturesBytesObservedBeforeRelayWriteFails` |
+| `EXT-RELAY-002` | `AC-RELAY-001` | `INT-RELAY-002`, `INT-CMP-002`, `INT-CMP-006` | `TcpTapTest.relaysBothDirectionsAndPropagatesHalfClose`, `TcpTapTest.captureWriteFailureDoesNotBreakRelay` |
+| `EXT-RELAY-003` | `AC-RELAY-002`, `AC-CAP-005` | `INT-CMP-002`, `INT-CMP-003`, `INT-CMP-006`, `INT-LIFE-002` | `TcpTapTest.relayIoErrorTerminatesSessionAndRecordsReset`, `TcpTapTest.capturesBytesObservedBeforeRelayWriteFails` |
+| `EXT-FILE-001` | `AC-FILE-001` | `INT-LIFE-001`, `INT-CMP-004`, `INT-CMP-007` | `TcpTapExecTest.existingCaptureFileIsNotOverwrittenAtStartup`, `PcapNgWriterTest.doesNotOverwriteExistingCaptureFile` |
+| `EXT-CAP-001` | `AC-CAP-001`, `AC-CAP-002`, `AC-CAP-004`, `AC-CAP-005` | `INT-CMP-004`, `INT-CMP-005`, `INT-CMP-006`, `INT-CMP-007`, `INT-CAP-001` | IPv4 の sequence／ACK／checksum、観測ストリームとキャプチャの結合、IPv6／IPv4-mapped IPv6、終了済み方向への重複イベント抑止を検証済み |
+| `EXT-CAP-002` | `AC-CAP-002` | `INT-ERR-001`, `INT-CAP-002`, `INT-CMP-004`, `INT-CMP-007` | `PcapNgWriterTest.writesConnectErrorAsDiagnosticEventWithPacketComment`, `sanitizesAndEscapesConnectErrorDiagnosticValues`, `TcpTapExecTest.destinationConnectFailureIsWrittenToDiagnosticCapture`, `diagnosticValuesKeep4096AndTruncateBeyondLimit` |
+| `EXT-CAP-003` | `AC-CAP-003` | `INT-ERR-002`, `INT-CMP-007` | `TcpTapTest.captureWriteFailureDoesNotBreakRelay` |
 
 `EXT-NET-003` / `EXT-NET-004` の待受処理継続は、外部ネットワークの応答時間に依存しない差し替え可能な中継先ソケットをテストで使用し、接続待ち中と接続失敗後の両方を回帰テストで直接検証します。
 
