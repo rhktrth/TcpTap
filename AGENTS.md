@@ -141,6 +141,10 @@ private method 名、local variable、buffer size、単純な helper 分割等�
 - Issue、PR、コミット説明は日本語で書く。識別子・製品名・技術用語は不自然に日本語化しない。
 - unrelated refactoring を同じ PR に混ぜない。ただし最小構成へ整理するため不可分な削除・統合はまとめてよい。
 - ユーザーから継続的なmerge指示がある作業では、CI成功と差分確認後にPRをmergeしてよい。
+- AI・エージェントが PR を使って変更する場合、実装・修正を反復している間は原則として Draft PR を維持する。必要なローカル確認を終え、CI で確認したい状態まで差分をまとめてから Ready for review へ変更する。
+- Ready for review への変更は、通常 CI を実行する明示的なチェックポイントとして扱う。Actions 実行回数を抑えるため、Ready 状態の PR へ細かな修正コミットを連続 push する運用は原則として行わない。
+- Ready 状態で CI が失敗し、追加修正が必要になった場合は、原則として PR を Draft へ戻してから修正する。Draft 中に必要なコミット・push とローカル確認をまとめ、再び CI で確認できる状態になってから Ready for review へ戻す。
+- ユーザーが Ready 状態の維持、即時の CI 再実行、または別の PR 運用を明示した場合は、その指示を優先する。
 
 ## Definition of Done
 
